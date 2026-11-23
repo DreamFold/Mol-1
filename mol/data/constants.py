@@ -583,7 +583,29 @@ RES_ATOMS_DICT = {
         "OXT": 12,
     },
     "VAL": {"N": 0, "CA": 1, "C": 2, "O": 3, "CB": 4, "CG1": 5, "CG2": 6, "OXT": 7},
-    "UNK": {"N": 0, "CA": 1, "C": 2, "O": 3, "CB": 4, "CG": 5, "OXT": 6},
+    # LOCAL ADDITION: UNK doubles as the *designed* residue, so its layout is
+    # padded to 14 fixed slots (see mol/data/core/design_residue.py). Slots
+    # 0-13 are the design layout; OXT is kept at 14, outside that layout, so a
+    # deposited C-terminal UNK still resolves a tokatom_idx instead of raising
+    # KeyError. 15 names stays under max_atoms_per_token = 24, so the released
+    # ConfidenceHead weight tables are unaffected.
+    "UNK": {
+        "N": 0,
+        "CA": 1,
+        "C": 2,
+        "O": 3,
+        "CB": 4,
+        "CG": 5,
+        "DV06": 6,
+        "DV07": 7,
+        "DV08": 8,
+        "DV09": 9,
+        "DV10": 10,
+        "DV11": 11,
+        "DV12": 12,
+        "DV13": 13,
+        "OXT": 14,
+    },
     "DA": {
         "OP3": 0,
         "P": 1,

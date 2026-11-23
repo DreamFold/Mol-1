@@ -28,6 +28,7 @@ from sklearn.neighbors import KDTree
 
 from mol.data.tools.rewrite_biotite import bond_rows
 from mol.data.constants import get_all_elems, STD_RESIDUES, STD_RESIDUES_WITH_GAP
+from mol.data.core import design_residue  # LOCAL ADDITION
 from mol.data.tokenizer import Token, TokenArray
 from mol.data.utils import get_atom_level_token_mask, get_ligand_polymer_bond_mask
 from mol.utils.geometry import angle_3p, random_transform
@@ -54,7 +55,14 @@ class Featurizer(object):
     ) -> None:
         self.cropped_token_array = cropped_token_array
 
-        self.cropped_atom_array = cropped_atom_array
+        # LOCAL ADDITION: a CIF cannot carry the spare element symbol used for
+        # a designed residue's virtual slots (type_symbol is two characters),
+        # so the mmCIF training path would disagree with the component-built
+        # JSON path. Normalise here, the one point both paths pass through.
+        # No-op when no designed residue is present.
+        self.cropped_atom_array = design_residue.normalize_design_atom_elements(
+            cropped_atom_array
+        )
         self.ref_pos_augment = ref_pos_augment
         self.lig_atom_rename = lig_atom_rename
         self.include_discont_poly_poly_bonds = include_discont_poly_poly_bonds

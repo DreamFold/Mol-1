@@ -29,7 +29,7 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from mol.data.pipeline.data_pipeline import DataPipeline
-from mol.utils.file_io import dump_gzip_pickle
+from mol.utils.file_io import dump_gzip_pickle, load_gzip_pickle
 
 
 def gen_a_bioassembly_data(
@@ -63,6 +63,14 @@ def gen_a_bioassembly_data(
         pdb_id = bioassembly_dict["pdb_id"]
         # save to output dir
         dump_gzip_pickle(bioassembly_dict, bioassembly_output_dir / f"{pdb_id}.pkl.gz")
+        # LOCAL ADDITION: persist this structure's index rows next to its
+        # bioassembly. Upstream only writes indices.csv after every worker has
+        # finished, so an interrupted run over thousands of structures leaves
+        # the pickles on disk but no usable index at all. The sidecar makes the
+        # job resumable and lets the CSV be rebuilt from partial progress.
+        dump_gzip_pickle(
+            sample_indices_list, bioassembly_output_dir / f"{pdb_id}.idx.pkl.gz"
+        )
         return sample_indices_list
 
 
@@ -73,6 +81,7 @@ def gen_data_from_mmcifs(
     cluster_file: Optional[Path],
     distillation: bool = False,
     num_workers: int = 1,
+    indices_only: bool = False,
 ):
     """
     Generates training data from a list of mmCIF files and saves the results to a CSV file.
@@ -87,23 +96,50 @@ def gen_data_from_mmcifs(
     """
     random.shuffle(mmcif_list)
 
-    all_sample_indices_list = [
-        r
-        for r in tqdm(
-            Parallel(n_jobs=num_workers, return_as="generator_unordered")(
-                delayed(gen_a_bioassembly_data)(
-                    mmcif, bioassembly_output_dir, cluster_file, distillation
-                )
-                for mmcif in mmcif_list
-            ),
-            total=len(mmcif_list),
-        )
+    # LOCAL ADDITION: skip structures already done, so an interrupted run can
+    # be restarted without redoing hours of parsing.
+    todo = [
+        mmcif
+        for mmcif in mmcif_list
+        if not (bioassembly_output_dir / f"{mmcif.stem.lower()}.idx.pkl.gz").is_file()
     ]
+    if indices_only:
+        print(f"indices-only: assembling from completed structures, skipping {len(todo)}")
+        todo = []
+    elif len(todo) != len(mmcif_list):
+        print(f"resuming: {len(mmcif_list) - len(todo)} already done, {len(todo)} to go")
 
+    # LOCAL ADDITION: `return_as` arrived in joblib 1.3; fall back to the
+    # eager list form on older installs rather than failing at import time.
+    # Only the streaming behaviour differs, not the result.
+    import inspect
+
+    if todo:
+        jobs = (
+            delayed(gen_a_bioassembly_data)(
+                mmcif, bioassembly_output_dir, cluster_file, distillation
+            )
+            for mmcif in todo
+        )
+        if "return_as" in inspect.signature(Parallel.__init__).parameters:
+            results = Parallel(n_jobs=num_workers, return_as="generator_unordered")(jobs)
+        else:
+            results = Parallel(n_jobs=num_workers)(jobs)
+        for _ in tqdm(results, total=len(todo)):
+            pass
+
+    # LOCAL ADDITION: assemble the CSV from the per-structure sidecars rather
+    # than from this run's return values, so partial progress is still usable.
     merged_results = []
-    for sample_indices_list in all_sample_indices_list:
-        if sample_indices_list:
-            merged_results += sample_indices_list
+    for sidecar in sorted(bioassembly_output_dir.glob("*.idx.pkl.gz")):
+        try:
+            rows = load_gzip_pickle(sidecar)
+        except Exception as exc:
+            print(f"skipping unreadable {sidecar.name}: {exc}")
+            continue
+        if rows:
+            merged_results += rows
+    print(f"index rows from {len(list(bioassembly_output_dir.glob('*.idx.pkl.gz')))} structures")
     df = pd.DataFrame(merged_results)
 
     df.to_csv(output_indices_csv, index=False, quoting=csv.QUOTE_NONNUMERIC)
@@ -116,6 +152,7 @@ def run_gen_data(
     cluster_file: Optional[Path],
     distillation: bool = False,
     num_workers: int = 1,
+    indices_only: bool = False,
 ):
     """
     Generates data from MMCIF files and saves the output to specified locations.
@@ -155,6 +192,7 @@ def run_gen_data(
         cluster_file,
         distillation,
         num_workers,
+        indices_only,
     )
 
 
@@ -197,6 +235,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--indices_only",
+        action="store_true",
+        help="Do not parse anything new; just rebuild indices.csv from the "
+             "per-structure sidecars already on disk. Lets a partially "
+             "completed run be used for training.",
+    )
+    parser.add_argument(
         "-n",
         "--n_cpu",
         type=int,
@@ -213,4 +258,5 @@ if __name__ == "__main__":
         cluster_file=args.cluster_file,
         distillation=args.distillation,
         num_workers=args.n_cpu,
+        indices_only=args.indices_only,
     )

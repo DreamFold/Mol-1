@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mol.model import sample_confidence
+from mol.model.design_masker import apply_design_mask  # LOCAL ADDITION
 from mol.model.generator import (
     InferenceNoiseScheduler,
     sample_diffusion,
@@ -111,6 +112,12 @@ class Mol(nn.Module):
         self.N_cycle = self.configs.model.N_cycle
         self.N_model_seed = self.configs.model.N_model_seed
         self.train_confidence_only = configs.train_confidence_only
+        # LOCAL ADDITION: blank sequence-derived inputs for designed residues.
+        # Defaults to True because it is a no-op unless a token is actually
+        # designed, so a pure folding run is unaffected either way.
+        self.mask_design_inputs = bool(
+            getattr(configs.model, "mask_design_inputs", True)
+        )
         if self.train_confidence_only:  # the final finetune stage
             assert configs.loss.weight.alpha_diffusion == 0.0
             assert configs.loss.weight.alpha_distogram == 0.0
@@ -990,6 +997,14 @@ class Mol(nn.Module):
         assert mode in ["train", "eval", "inference"]
         not_use_gradient = not (self.training or torch.is_grad_enabled())
         inplace_safe = not_use_gradient and (not disable_inplace)
+
+        # LOCAL ADDITION: erase sequence-derived evidence about designed
+        # residues before anything reads the features. Must precede
+        # generate_relp / update_input_feature_dict, which cache derived
+        # tensors. A no-op when no token is designed, so pure folding batches
+        # keep exactly their original path. See mol/model/design_masker.py.
+        if self.mask_design_inputs:
+            input_feature_dict = apply_design_mask(input_feature_dict)
 
         input_feature_dict = self.relative_position_encoding.generate_relp(
             input_feature_dict

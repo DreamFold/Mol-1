@@ -1,0 +1,9 @@
+# Trim the py_modules upload. Only `mol/` needs to reach the cluster; the rest
+# is ~55MB of git history, assets and docs re-uploaded on every job submit.
+.git/
+.github/
+.pytest_cache/
+__pycache__/
+assets/
+docs/
+tests/

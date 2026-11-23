@@ -34,6 +34,7 @@ from rdkit import Chem
 
 from mol.data.tools.rewrite_biotite import bond_rows, select_bonds
 from mol.config.data import data_configs
+from mol.data.core import design_residue  # LOCAL ADDITION
 from mol.data.core.substructure_perms import get_substructure_perms
 from mol.utils.logger import get_logger
 
@@ -125,6 +126,18 @@ def get_component_atom_array(
         logger.debug(
             f"CCD {ccd_code} has leaving atom group bond to more than one central atom, central_to_leaving_groups is None."
         )
+
+    # LOCAL ADDITION: pad the designed-residue component out to a fixed slot
+    # count, so the atom count cannot leak the residue identity a design model
+    # is supposed to invent. Done last so leaving-atom filtering and
+    # central_to_leaving_groups are computed on the real component first.
+    #
+    # Applied on BOTH leaving-atom paths deliberately: the polymer builder asks
+    # for keep_leaving_atoms=True and strips per position, so padding only the
+    # False path left designed residues at their native 6 atoms.
+    if ccd_code == design_residue.DESIGN_RESIDUE:
+        comp = design_residue.extend_component_atom_array(comp)
+
     return comp
 
 
@@ -210,20 +223,30 @@ def get_component_rdkit_mol(ccd_code: str) -> Union[Chem.Mol, None]:
     """
     global _ccd_rdkit_mols
     # _ccd_rdkit_mols is not empty
-    if _ccd_rdkit_mols:
-        return _ccd_rdkit_mols.get(ccd_code, None)
+    if not _ccd_rdkit_mols:
+        rdkit_mol_pkl = RKDIT_MOL_PKL
+        if rdkit_mol_pkl.exists():
+            with open(rdkit_mol_pkl, "rb") as f:
+                _ccd_rdkit_mols = pickle.load(f)
+        else:
+            raise FileNotFoundError(
+                f"CCD components file {rdkit_mol_pkl} not found. Set MOL_ROOT_DIR "
+                "and fetch the shared caches with "
+                "scripts/database/download_mol_data.sh before running."
+            )
 
-    rdkit_mol_pkl = RKDIT_MOL_PKL
-    if rdkit_mol_pkl.exists():
-        with open(rdkit_mol_pkl, "rb") as f:
-            _ccd_rdkit_mols = pickle.load(f)
-        return _ccd_rdkit_mols.get(ccd_code, None)
-    else:
-        raise FileNotFoundError(
-            f"CCD components file {rdkit_mol_pkl} not found. Set MOL_ROOT_DIR "
-            "and fetch the shared caches with "
-            "scripts/database/download_mol_data.sh before running."
-        )
+    mol = _ccd_rdkit_mols.get(ccd_code, None)
+
+    # LOCAL ADDITION: give the designed-residue component its fixed slot count
+    # on the reference-conformer side too, so atom_map / ref_mask / coords stay
+    # in step with the padded AtomArray. Memoized back into the cache, since
+    # this function is called once per residue.
+    if ccd_code == design_residue.DESIGN_RESIDUE and mol is not None:
+        if not design_residue.is_extended(getattr(mol, "atom_map", {}).keys()):
+            mol = design_residue.extend_rdkit_mol(mol)
+            _ccd_rdkit_mols[ccd_code] = mol
+
+    return mol
 
 
 @functools.lru_cache
@@ -312,6 +335,13 @@ def get_ccd_ref_info(
         results["perm"] = (
             perm.T
         )  # np.ndarray[int]: atom permutation, shape:(n_atom_wo_h, n_perm)
+
+        # LOCAL ADDITION: the designed residue's virtual slots are mutually
+        # indistinguishable disconnected dummy atoms, so substructure matching
+        # generates permutations that would reshuffle them -- destroying the
+        # geometric identity code they exist to carry. Force the identity.
+        if ccd_code == design_residue.DESIGN_RESIDUE:
+            results["perm"] = design_residue.identity_perm(mol.GetNumAtoms())
 
     return results
 
