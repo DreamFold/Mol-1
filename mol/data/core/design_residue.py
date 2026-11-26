@@ -45,8 +45,13 @@ geometric decoder counts how many surplus slots sit within a threshold of
 
 from __future__ import annotations
 
+import itertools
 import logging
+import os
 from typing import Any, Mapping, Optional, Sequence
+
+from functools import lru_cache
+from types import MappingProxyType
 
 import numpy as np
 
@@ -212,12 +217,13 @@ def extend_rdkit_mol(mol: Any) -> Any:
     side, extending the custom attributes ``atom_map``, ``ref_mask`` and
     ``ref_conf_id`` that ``get_ccd_ref_info`` reads.
 
-    Virtual atoms get ``ref_mask = False``. That is not cosmetic: the atom
+    Virtual atoms get ``ref_mask`` from :data:`VIRTUAL_REF_MASK`. The atom
     encoder multiplies the per-atom embedding by ``ref_mask``
-    (``mol/model/modules/transformer.py``), so a virtual slot contributes a
-    zero embedding while still occupying an index and still receiving a
-    predicted coordinate -- exactly the behaviour a virtual slot needs, with no
-    architectural change.
+    (``mol/model/modules/transformer.py``), so ``False`` makes a virtual slot
+    contribute a zero embedding while still occupying an index and still
+    receiving a predicted coordinate, and ``True`` makes it visible -- which
+    is what BoltzGen does. See :data:`VIRTUAL_REF_MASK` for why that matters
+    and which is the default.
     """
     from rdkit import Chem
 
@@ -262,16 +268,160 @@ def extend_rdkit_mol(mol: Any) -> Any:
     extended.ref_conf_id = getattr(mol, "ref_conf_id", -1)
 
     ref_mask = np.asarray(getattr(mol, "ref_mask", np.ones(base_n, dtype=bool)))
+    fill = np.ones if VIRTUAL_REF_MASK else np.zeros
     extended.ref_mask = np.concatenate(
-        [ref_mask, np.zeros(n_missing, dtype=ref_mask.dtype)]
+        [ref_mask, fill(n_missing, dtype=ref_mask.dtype)]
     )
     return extended
+
+
+#: Observed amino-acid composition of designed (CDR) residues, measured by
+#: decoding 4,572 designed residues out of 118 prepared structures in
+#: ``design_data_v2``. Used only by the ``balanced`` codeword strategy, to
+#: weight the N/O split by how often each residue is actually supervised
+#: rather than treating all twenty as equally common -- SER alone is 14% of
+#: designed positions and CYS is 0.04%.
+CDR_COMPOSITION: Mapping[str, float] = MappingProxyType({
+    "SER": 0.142, "TYR": 0.113, "THR": 0.093, "GLY": 0.083, "ASN": 0.077,
+    "ASP": 0.065, "LEU": 0.058, "PHE": 0.051, "ALA": 0.050, "ARG": 0.047,
+    "GLN": 0.042, "PRO": 0.035, "HIS": 0.029, "ILE": 0.025, "LYS": 0.023,
+    "GLU": 0.022, "VAL": 0.022, "TRP": 0.015, "MET": 0.008, "CYS": 0.001,
+})
+
+#: Whether a virtual slot is visible to the atom encoder.
+#:
+#: ``False`` is what this fork shipped: ``ref_mask = 0``, and Mol-1 multiplies
+#: the per-atom embedding by it (``transformer.py:953,965``) *after* the
+#: element and atom-name contributions, so the whole embedding is zeroed. A
+#: virtual slot then holds an index and receives a predicted coordinate while
+#: contributing nothing -- which was the right call for Phase 0, where the
+#: goal was to get a 14-slot residue through the pipeline without touching
+#: the architecture.
+#:
+#: It is NOT what BoltzGen does, and the difference falls exactly on the
+#: slots that carry the identity code. BoltzGen gives a fake atom a real
+#: element row (``const.fake_element_id``), a real reference position (CA's),
+#: and full passage through the atom encoder --
+#: ``data/feature/featurizer.py:1160-1165``; its ``atom_pad_mask`` is tensor
+#: padding and does not gate fakes out. Under ``False`` our eight code-bearing
+#: slots enter the structure module with identical, zero representations, all
+#: their reference positions are CA copies so the pair features are degenerate
+#: too, and ``atom_to_tokatom_idx`` reaches only the confidence head. The
+#: model cannot tell slot 6 from slot 13, yet the per-index MSE demands a
+#: different coordinate at each.
+#:
+#: ``True`` restores the BoltzGen behaviour: the slot keeps its distinct
+#: :data:`VIRTUAL_ELEMENT` and its CA reference position, and is no longer
+#: zeroed. No architectural change, and no data rebuild -- ``ref_mask`` comes
+#: from the CCD component at featurization time, while the prepared CIFs hold
+#: only coordinates.
+#:
+#: Default is the historical behaviour so existing runs reproduce; flip it
+#: with ``MOL_DESIGN_VIRTUAL_REF_MASK=1`` for the A/B.
+VIRTUAL_REF_MASK: bool = os.environ.get(
+    "MOL_DESIGN_VIRTUAL_REF_MASK", "0"
+).lower() in ("1", "true", "yes")
+
+
+#: How surplus slots are split between the two anchors.
+#:
+#: ``pure_o_first``
+#:     What Mol-1 shipped. The greedy tries ``on_n = 0`` first, so the first
+#:     residues to claim take the pure-O codewords ``(0, k)``. Ten of twenty
+#:     end up pure-O and 87.9% of label mass (weighted by
+#:     :data:`CDR_COMPOSITION`) sits on ``O``. Under a coordinate MSE, whose
+#:     minimiser under uncertainty is the conditional mean, that makes "park
+#:     everything on O" the risk-minimising hedge -- and it scores 49% of
+#:     designed residues correct for free. Scoring xid 284 found the model
+#:     doing exactly this: 77.6% of slots that should park on N were inside
+#:     O's capture zone, 0.0% the reverse.
+#:
+#: ``balanced``
+#:     Chooses the split that brings weighted N mass closest to O mass, giving
+#:     50.7% / 49.3%, while leaving both the pure-O and the pure-N columns
+#:     empty. Neither anchor is then a useful hedge, and neither degenerate
+#:     strategy produces a decodable codeword.
+#:
+#: CHANGING THIS INVALIDATES PREPARED DATA AND CHECKPOINTS. The codeword *is*
+#: the label geometry, so a dataset prepared under one strategy and trained
+#: under the other is silently mislabelled in every designed residue. Stamp
+#: :func:`codebook_fingerprint` into prepared data and check it.
+CODEBOOK_STRATEGY: str = os.environ.get("MOL_CODEBOOK_STRATEGY", "pure_o_first")
+
+_STRATEGIES = ("pure_o_first", "balanced")
+
+
+def _claim_pure_o_first(
+    groups: Mapping[int, Sequence[str]],
+) -> dict[str, tuple[int, int]]:
+    """Mol-1 as shipped: first free split, counting ``on_n`` up from zero."""
+    claimed: set[tuple[int, int]] = set()
+    out: dict[str, tuple[int, int]] = {}
+    for k in sorted(groups):
+        for res in groups[k]:
+            for on_n in range(k + 1):
+                if (on_n, k - on_n) not in claimed:
+                    claimed.add((on_n, k - on_n))
+                    out[res] = (on_n, k - on_n)
+                    break
+            else:  # pragma: no cover - unreachable for the standard 20
+                raise ValueError(f"no free (N, O) split for {res}")
+    return out
+
+
+def _claim_balanced(
+    groups: Mapping[int, Sequence[str]],
+    composition: Mapping[str, float],
+) -> dict[str, tuple[int, int]]:
+    """Split so the frequency-weighted N and O mass come out even.
+
+    Residues sharing a surplus total compete for the same cells -- ``on_n +
+    on_o`` is fixed by the atom inventory -- so the choice is made per group
+    by exhaustive search over assignments of distinct ``on_n`` values. The
+    largest group has five members over nine cells, so this is a few thousand
+    evaluations and needs no heuristic to be trusted.
+
+    **Both extreme columns are excluded.** A codeword with ``on_n = 0`` is one
+    a model that has learned only "park on O" produces for free, and because
+    the achievable surplus totals are ``{0, 2, 3, ... 10}``, an occupied
+    ``(0, k)`` also means that model's *mistakes* land on a valid codeword and
+    decode silently. ``on_o = 0`` is the mirror of the same problem. Excluding
+    both costs 0.2 percentage points of balance (50.7% vs 50.5% on O) and
+    takes the silent-failure count for either degenerate strategy from six to
+    zero.
+
+    A zero-surplus residue has exactly one possible codeword, ``(0, 0)``, and
+    is passed through. That is TRP, and it is why the decode sink cannot be
+    closed here -- it needs a separate occupancy guard.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for k in sorted(groups):
+        members = list(groups[k])
+        if k == 0:
+            for res in members:
+                out[res] = (0, 0)
+            continue
+        cells = list(range(1, k)) if k >= 2 else list(range(k + 1))
+        if len(cells) < len(members):
+            raise ValueError(
+                f"{len(members)} residues share surplus {k} but only "
+                f"{len(cells)} interior codewords exist for it")
+        best, best_cost = None, None
+        for combo in itertools.permutations(cells, len(members)):
+            cost = abs(sum(composition.get(m, 0.0) * (2 * a - k)
+                           for m, a in zip(members, combo)))
+            if best_cost is None or cost < best_cost:
+                best, best_cost = combo, cost
+        for res, on_n in zip(members, best):
+            out[res] = (on_n, k - on_n)
+    return out
 
 
 def build_codebook(
     res_atoms_dict: Optional[Mapping[str, Mapping[str, int]]] = None,
     residues: Sequence[str] = STANDARD_AA,
-) -> dict[str, tuple[tuple[str, ...], tuple[int, int]]]:
+    strategy: Optional[str] = None,
+) -> Mapping[str, tuple[tuple[str, ...], tuple[int, int]]]:
     """Derive the geometric residue-type codebook from Mol-1's atom inventory.
 
     For every standard residue, returns its real atoms in slot order and the
@@ -287,6 +437,19 @@ def build_codebook(
     between models -- Mol-1's table includes ``OXT``, BoltzGen's does not -- so
     a codebook copied from another model is simply wrong here.
     """
+    strategy = CODEBOOK_STRATEGY if strategy is None else strategy
+    if strategy not in _STRATEGIES:
+        raise ValueError(f"unknown strategy {strategy!r}, expected one of "
+                         f"{_STRATEGIES}")
+
+    # The no-argument call is the hot path -- `decode_residue` makes it once
+    # per residue when a codebook is not passed in, and deriving the table
+    # costs ~0.4 ms. Only that case is cached: the arguments are a Mapping and
+    # a Sequence, neither hashable, so `lru_cache` cannot wrap the function
+    # itself. Callers that supply their own inventory still derive fresh.
+    if res_atoms_dict is None and tuple(residues) == tuple(STANDARD_AA):
+        return _default_codebook(strategy)
+
     if res_atoms_dict is None:
         from mol.data.constants import RES_ATOMS_DICT as res_atoms_dict
 
@@ -308,21 +471,41 @@ def build_codebook(
         sidechain = [a for a in names if a not in BACKBONE_ATOMS_4]
         atom_order[res] = tuple(BACKBONE_ATOMS_4) + tuple(sidechain)
 
-    codebook: dict[str, tuple[tuple[str, ...], tuple[int, int]]] = {}
-    claimed: set[tuple[int, int]] = set()
-    for res in sorted(residues, key=lambda r: (N_DESIGN_SLOTS - len(atom_order[r]), r)):
-        n_virtual = N_DESIGN_SLOTS - len(atom_order[res])
-        for on_n in range(n_virtual + 1):
-            codeword = (on_n, n_virtual - on_n)
-            if codeword not in claimed:
-                claimed.add(codeword)
-                codebook[res] = (atom_order[res], codeword)
-                break
-        else:  # pragma: no cover - unreachable for the standard 20
-            raise ValueError(f"no free (N, O) split for {res}")
+    # Group by surplus count. Residues only ever compete with others of the
+    # same count -- `on_n + on_o` is fixed by the atom inventory -- so the
+    # claim is independent per group, which is what makes the exhaustive
+    # search in the balanced strategy cheap. Ties break alphabetically for
+    # reproducibility.
+    groups: dict[int, list[str]] = {}
+    for res in sorted(residues):
+        groups.setdefault(N_DESIGN_SLOTS - len(atom_order[res]), []).append(res)
 
+    if strategy == "balanced":
+        words = _claim_balanced(groups, CDR_COMPOSITION)
+    else:
+        words = _claim_pure_o_first(groups)
+
+    codebook = {res: (atom_order[res], words[res]) for res in sorted(residues)}
     assert len({c for _, c in codebook.values()}) == len(codebook), "codewords collide"
-    return codebook
+    return MappingProxyType(codebook)
+
+
+@lru_cache(maxsize=len(_STRATEGIES))
+def _default_codebook(
+    strategy: str = "pure_o_first",
+) -> Mapping[str, tuple[tuple[str, ...], tuple[int, int]]]:
+    """The standard-20 codebook, derived once.
+
+    Returns a read-only ``MappingProxyType`` rather than a dict. The cache
+    hands every caller the SAME object, so a mutable one would let any of
+    them silently redefine the residue code for the whole process -- the kind
+    of shared-mutable-default bug that surfaces as a wrong amino acid months
+    later. The values are already tuples, so the proxy makes the whole
+    structure immutable.
+    """
+    from mol.data.constants import RES_ATOMS_DICT
+
+    return build_codebook(RES_ATOMS_DICT, STANDARD_AA, strategy=strategy)
 
 
 def encode_residue(
@@ -404,6 +587,67 @@ def decode_residue(
         int(counts[BACKBONE_ATOMS_4.index("O")]),
     )
     return by_codeword.get(codeword, unknown)
+
+
+def codebook_fingerprint(
+    codebook: Optional[Mapping[str, tuple[tuple[str, ...], tuple[int, int]]]] = None,
+) -> str:
+    """Short stable hash of a codebook's residue -> codeword mapping.
+
+    The codeword IS the label geometry: a dataset prepared under one strategy
+    and trained under another is mislabelled in every designed residue, and
+    nothing downstream would notice -- the shapes match, the losses are
+    finite, and the model simply learns the wrong code. Stamp this into
+    prepared data and compare it at load time so that failure is loud.
+
+    Only the codewords enter the hash. Atom order is derived from the same
+    inventory and cannot differ without the codewords differing too.
+    """
+    import hashlib
+
+    if codebook is None:
+        codebook = build_codebook()
+    payload = ";".join(f"{res}:{code[0]},{code[1]}"
+                       for res, (_, code) in sorted(codebook.items()))
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+def check_codebook_stamp(data_dir: Any, strict: bool = True) -> Optional[dict]:
+    """Verify a prepared dataset was built with the codebook now in force.
+
+    ``prepare_design_data.py`` writes ``codebook.json`` beside the data. A
+    mismatch means every designed residue in that set carries the wrong
+    codeword, which is invisible downstream -- shapes match, losses are
+    finite, the model simply learns a different code. Raising is the point.
+
+    Returns the stamp, or ``None`` if the directory has none (datasets built
+    before stamping existed; a warning, not an error, since they predate the
+    only strategy that was available).
+    """
+    import json
+    from pathlib import Path as _Path
+
+    stamp_path = _Path(data_dir) / "codebook.json"
+    if not stamp_path.is_file():
+        logger.warning(
+            "%s has no codebook.json; cannot verify it matches strategy %r. "
+            "Rebuild, or confirm by hand.", data_dir, CODEBOOK_STRATEGY)
+        return None
+
+    stamp = json.loads(stamp_path.read_text())
+    mine = codebook_fingerprint()
+    if stamp.get("fingerprint") != mine:
+        message = (
+            f"{data_dir} was prepared with codebook "
+            f"{stamp.get('fingerprint')} ({stamp.get('strategy')}) but this "
+            f"process uses {mine} ({CODEBOOK_STRATEGY}). Every designed "
+            f"residue would be mislabelled. Set MOL_CODEBOOK_STRATEGY="
+            f"{stamp.get('strategy')!r}, or rebuild the dataset."
+        )
+        if strict:
+            raise ValueError(message)
+        logger.error("%s", message)
+    return stamp
 
 
 def normalize_design_atom_elements(atom_array: Any) -> Any:

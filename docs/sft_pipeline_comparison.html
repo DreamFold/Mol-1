@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFT pipelines: BoltzGen vs Mol-1</title>
+<style>
+  /* Palette: reference instance, categorical slots 1 (blue) and 2 (orange),
+     used in fixed order. Identity is never carried by colour alone -- every
+     pipeline is named in text and marked with a border and a letter badge. */
+  :root {
+    --surface-1:#fcfcfb; --page:#f9f9f7;
+    --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+    --rule:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,0.10);
+    --bg:#2a78d6;      /* slot 1 - BoltzGen */
+    --m1:#eb6834;      /* slot 2 - Mol-1    */
+    --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+    --wash-bg:rgba(42,120,214,0.08); --wash-m1:rgba(235,104,52,0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1:#1a1a19; --page:#0d0d0d;
+      --ink:#f0efec; --ink-2:#c3c2b7; --muted:#898781;
+      --rule:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+      --bg:#3987e5; --m1:#d95926;
+      --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+      --wash-bg:rgba(57,135,229,0.12); --wash-m1:rgba(217,89,38,0.12);
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; padding:32px 24px 72px;
+    background:var(--page); color:var(--ink);
+    font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:26px; margin:0 0 6px; letter-spacing:-0.01em; }
+  h2 { font-size:19px; margin:40px 0 12px; letter-spacing:-0.01em; }
+  h3 { font-size:15px; margin:22px 0 8px; color:var(--ink-2); }
+  p  { margin:8px 0; color:var(--ink-2); max-width:78ch; }
+  code { font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+         background:var(--wash-bg); padding:1px 5px; border-radius:4px; color:var(--ink); }
+  @media (prefers-color-scheme: dark) { code { background:rgba(255,255,255,0.07); } }
+  .sub { color:var(--muted); font-size:13px; margin-top:0; }
+
+  /* two-column pipeline comparison */
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:16px; }
+  @media (max-width:900px){ .cols { grid-template-columns:1fr; } }
+
+  .col { background:var(--surface-1); border:1px solid var(--border);
+         border-radius:10px; padding:16px 16px 20px; }
+  .col.bgen { border-top:3px solid var(--bg); }
+  .col.mol  { border-top:3px solid var(--m1); }
+
+  .badge { display:inline-flex; align-items:center; gap:7px;
+           font-weight:650; font-size:14px; margin-bottom:2px; }
+  .dot { width:10px; height:10px; border-radius:3px; flex:none; }
+  .bgen .dot { background:var(--bg); }
+  .mol  .dot { background:var(--m1); }
+  .path { font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+          color:var(--muted); margin:0 0 14px; word-break:break-all; }
+
+  /* flow nodes */
+  .node { border:1px solid var(--border); border-left:3px solid var(--axis);
+          border-radius:7px; padding:9px 11px; margin:0; background:var(--surface-1); }
+  .bgen .node { border-left-color:var(--bg); background:var(--wash-bg); }
+  .mol  .node { border-left-color:var(--m1); background:var(--wash-m1); }
+  .node .t { font-weight:620; font-size:13.5px; }
+  .node .d { font-size:12.5px; color:var(--ink-2); margin-top:3px; }
+  .node .f { font:11.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+             color:var(--muted); margin-top:4px; word-break:break-all; }
+  .arrow { text-align:center; color:var(--axis); font-size:15px; line-height:1;
+           margin:5px 0; }
+  .fan { margin:6px 0 0 14px; padding-left:13px; border-left:1px dashed var(--axis); }
+  .fan .node { margin-top:7px; }
+
+  /* tables */
+  table { border-collapse:collapse; width:100%; margin-top:12px; font-size:13.5px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--rule);
+          vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px;
+       text-transform:uppercase; letter-spacing:0.04em; }
+  td.k { font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .mark { font-weight:700; }
+  .yes { color:var(--good); }    .no  { color:var(--critical); }
+  .part{ color:var(--warning); }
+  .legend { display:flex; gap:18px; flex-wrap:wrap; margin:10px 0 0;
+            font-size:12.5px; color:var(--ink-2); }
+  .legend span { display:inline-flex; align-items:center; gap:6px; }
+
+  .note { border-left:3px solid var(--axis); background:var(--surface-1);
+          border:1px solid var(--border); border-left-width:3px;
+          border-radius:7px; padding:11px 13px; margin:14px 0; font-size:13.5px; }
+  .note.warn { border-left-color:var(--warning); }
+  .note.crit { border-left-color:var(--critical); }
+  .note b { color:var(--ink); }
+  ul { margin:8px 0; padding-left:20px; color:var(--ink-2); max-width:78ch; }
+  li { margin:4px 0; }
+  footer { margin-top:44px; padding-top:14px; border-top:1px solid var(--rule);
+           color:var(--muted); font-size:12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>SFT training pipelines: BoltzGen vs Mol-1</h1>
+<p class="sub">How each run is driven, checkpointed and logged &mdash; and where the
+Mol-1 CDR-design run differs from the BoltzGen one it is meant to match.</p>
+
+<div class="legend">
+  <span><i class="dot" style="background:var(--bg);width:10px;height:10px;border-radius:3px;display:inline-block"></i> <b>A</b> &middot; BoltzGen SFT (df-boltzgen)</span>
+  <span><i class="dot" style="background:var(--m1);width:10px;height:10px;border-radius:3px;display:inline-block"></i> <b>B</b> &middot; Mol-1 CDR design</span>
+</div>
+
+<h2>The two stacks, side by side</h2>
+
+<div class="cols">
+
+  <!-- ============== BOLTZGEN ============== -->
+  <div class="col bgen">
+    <div class="badge"><span class="dot"></span>A &middot; BoltzGen SFT</div>
+    <p class="path">/mnt/user_storage/Projects/df-boltzgen</p>
+
+    <div class="node"><div class="t">anyscale_training.py</div>
+      <div class="d">Builds cluster + argv; <code>--mode train</code> or <code>sweep</code>.</div>
+      <div class="f">dfnv/scripts/anyscale_training.py</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">RayTraining.run()</div>
+      <div class="d">Ray Train owns the workers; the driver orchestrates only.</div>
+      <div class="f">df_boltzgen/trainers/ray_train.py:444</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">_build_loggers()</div>
+      <div class="d">WandbLogger, <code>id = md5(exp_id)</code>, <b>resume="allow"</b>.</div>
+      <div class="f">trainers/train.py:102</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">_extra_callbacks()</div>
+      <div class="d">Four callbacks; checkpoints come from three of them.</div>
+      <div class="f">ray_train.py:543</div></div>
+
+    <div class="fan">
+      <div class="node"><div class="t">RayValidationReportCallback</div>
+        <div class="d">Checkpoint at validation end.</div></div>
+      <div class="node"><div class="t">RayTrainTimeReportCallback</div>
+        <div class="d">Checkpoint on a timer &mdash; default every 60&nbsp;min.</div></div>
+      <div class="node"><div class="t">RayEpochReportCallback</div>
+        <div class="d">Checkpoint at epoch end (<code>checkpoint_every_epoch</code>).</div></div>
+      <div class="node"><div class="t">EvalJobSpecCallback</div>
+        <div class="d">Emits an <b>eval job per new checkpoint</b>. This is the KPI path.</div>
+        <div class="f">ray_train.py:80</div></div>
+    </div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">Sidecar eval jobs</div>
+      <div class="d">One job per (group, complex): design &rarr; inverse-fold &rarr;
+        refold &rarr; analysis. Yields <code>bb_rmsd</code>,
+        <code>bb_target_aligned_rmsd_design</code>,
+        <code>design_to_target_iptm</code>.</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">_sync_metrics_to_wandb()</div>
+      <div class="d">Aggregates finished sidecar results and logs them on the
+        <b>epoch axis</b>, asynchronously.</div>
+      <div class="f">ray_train.py:267</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">pl.Trainer loop</div>
+      <div class="d">Lightning drives steps; <code>enable_checkpointing=False</code>
+        &mdash; Ray owns checkpoint writing.</div></div>
+  </div>
+
+  <!-- ============== MOL-1 ============== -->
+  <div class="col mol">
+    <div class="badge"><span class="dot"></span>B &middot; Mol-1 CDR design</div>
+    <p class="path">df-boltzgen/dfnv/mol1gen + Mol-1 fork</p>
+
+    <div class="node"><div class="t">anyscale job submit</div>
+      <div class="d">Entrypoint runs on the <b>head</b> (CPU).</div>
+      <div class="f">config/anyscale/mol1_cdr_design.yaml</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">ray_finetune.main()</div>
+      <div class="d">Submits ONE Ray task with <code>num_gpus=1</code>,
+        <code>max_retries=0</code>; forwards an env allowlist
+        (<code>WANDB_API_KEY</code>, <code>DREAMFOLD_XID</code>&hellip;).</div>
+      <div class="f">dfnv/mol1gen/ray_finetune.py</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">_train_on_worker() &mdash; GPU worker</div>
+      <div class="d">Guards: <code>torch.cuda.is_available()</code> and
+        <code>N_DESIGN_SLOTS == 14</code> (the design fork is really active).</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">finetune.main()</div>
+      <div class="d"><code>resolve_xid()</code> &rarr; W&amp;B id + run name;
+        <code>install(LoRAConfig)</code> patches <code>Mol</code> and
+        <code>try_load_checkpoint</code>; sets <code>sys.argv</code>.</div>
+      <div class="f">dfnv/mol1gen/finetune.py</div></div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">MolTrainer.run()</div>
+      <div class="d">Mol-1's own single-process step loop (world size 1).</div>
+      <div class="f">Mol-1/mol/runner/train.py</div></div>
+
+    <div class="fan">
+      <div class="node"><div class="t">init_log()</div>
+        <div class="d"><code>wandb.init(project, name, config, id)</code> &mdash;
+          four arguments only. No entity, group, tags or <b>resume</b>.</div>
+        <div class="f">train.py:130</div></div>
+      <div class="node"><div class="t">train_step()</div>
+        <div class="d">Logs <code>loss_dict</code> + lr every
+          <code>log_interval</code> (50).</div></div>
+      <div class="node"><div class="t">save_checkpoint()</div>
+        <div class="d">Every 400 steps: <code>{model, optimizer, scheduler, step}</code>
+          plus an EMA copy. <b>Keeps everything.</b></div></div>
+      <div class="node"><div class="t">evaluate()</div>
+        <div class="d"><b>Disabled</b> &mdash; <code>test_sets ""</code>,
+          <code>eval_interval -1</code>. No held-out set prepared.</div></div>
+    </div>
+    <div class="arrow">&darr;</div>
+
+    <div class="node"><div class="t">(no KPI stage)</div>
+      <div class="d">Nothing corresponds to the sidecar eval jobs, so no design
+        KPIs reach W&amp;B.</div></div>
+  </div>
+</div>
+
+<h2>The structural difference</h2>
+<p><b>BoltzGen treats design KPIs as a separate job.</b> It never computes
+<code>design_to_target_iptm</code> inside the training loop. It writes an eval job
+spec per checkpoint, that job runs the full design&nbsp;&rarr; inverse-fold&nbsp;&rarr;
+refold&nbsp;&rarr; analysis pipeline, and <code>_sync_metrics_to_wandb</code> pulls
+the results back onto the epoch axis later.</p>
+<p>That matters for the Mol-1 port: the KPIs are not blocked by Mol-1 and Boltz-2
+being unable to share an environment. BoltzGen reached the same conclusion and
+built a sidecar mechanism around it. Parity is a port of
+<code>EvalJobSpecCallback</code> + <code>wandb_sync</code>, not a rewrite of the
+training loop.</p>
+
+<h2>Feature parity</h2>
+<table>
+  <thead><tr><th>Capability</th><th>A &middot; BoltzGen</th><th>B &middot; Mol-1</th><th>Gap</th></tr></thead>
+  <tbody>
+    <tr><td>Checkpoint contents</td>
+        <td>model + optimizer + scheduler + step, EMA</td>
+        <td>same, plus EMA copy</td>
+        <td><span class="mark yes">at parity</span></td></tr>
+    <tr><td>Checkpoint cadence</td>
+        <td>epoch / validation / 60-min timer</td>
+        <td>fixed every 400 steps</td>
+        <td><span class="mark part">6&times; more often</span></td></tr>
+    <tr><td>Retention</td>
+        <td>Ray-managed, <code>save_top_k</code></td>
+        <td>keeps all &mdash; <b>36&nbsp;GB at step 3199</b>, ~225&nbsp;GB projected</td>
+        <td><span class="mark no">missing</span></td></tr>
+    <tr><td>Resume (optimizer + step)</td>
+        <td>Ray checkpoint restore</td>
+        <td><code>--resume-from</code>, non-EMA auto-select</td>
+        <td><span class="mark yes">added</span></td></tr>
+    <tr><td>W&amp;B losses + lr</td>
+        <td><code>train/loss</code>, <code>diffusion_loss</code>,
+            <code>distogram_loss</code>, <code>lr</code></td>
+        <td>equivalent via <code>loss_dict</code></td>
+        <td><span class="mark yes">at parity</span></td></tr>
+    <tr><td>W&amp;B run identity</td>
+        <td><code>id = md5(exp_id)</code>, <code>resume="allow"</code></td>
+        <td><code>id = name = xid</code>, no <code>resume</code></td>
+        <td><span class="mark part">resubmit may clash</span></td></tr>
+    <tr><td>Training diagnostics</td>
+        <td><code>grad_norm</code>, <code>param_norm</code>,
+            <code>single_norm</code>, <code>step_dur</code>, <code>forward_dur</code></td>
+        <td>none</td>
+        <td><span class="mark no">missing</span></td></tr>
+    <tr><td>Design KPIs (in-loop)</td>
+        <td><code>design_seq_recovery</code>, <code>design_rmsd</code></td>
+        <td><code>design_metrics.py</code> written, not yet wired</td>
+        <td><span class="mark part">in progress</span></td></tr>
+    <tr><td>Refold KPIs</td>
+        <td>13 keys in <code>const.eval_keys_confidence</code> via sidecar jobs</td>
+        <td>none</td>
+        <td><span class="mark no">needs sidecar port</span></td></tr>
+  </tbody>
+</table>
+
+<h2>Notes and caveats</h2>
+
+<div class="note warn">
+  <b>Checkpoint retention is the most urgent gap.</b> At 400-step intervals the
+  run wrote 36&nbsp;GB by step 3199 and projects to roughly 225&nbsp;GB over 20k
+  steps. BoltzGen's interval is 2500.
+</div>
+
+<div class="note crit">
+  <b>Training is currently stopped.</b> The last run reached step 3199 of 20000
+  and died at 21:14 on 21 Nov with an empty <code>errors/</code> directory &mdash;
+  a spot preemption, surfacing loudly because the Ray task is submitted with
+  <code>max_retries=0</code>. Observed rate: 13.8&nbsp;s/step, so 20k steps is
+  roughly 77&nbsp;hours.
+</div>
+
+<div class="note">
+  <b>Why the Mol-1 side needs a Ray task at all.</b> An Anyscale job entrypoint
+  runs on the head node. <code>finetune.py</code> calls Mol-1's trainer directly
+  in-process, so with the GPU on a worker the run reached a real
+  <code>train_step</code> and then died in the cuEquivariance kernel with
+  <code>libcuda.so.1: cannot open shared object file</code> &mdash; no NVIDIA
+  driver, because it was executing on a CPU-only instance. BoltzGen does not hit
+  this: Ray Train places its work on workers by construction.
+</div>
+
+<div class="note">
+  <b>Unverified.</b> The refold-KPI port, the sidecar mechanism, and the
+  BoltzGen&nbsp;&harr;&nbsp;Mol-1 design-directory handoff have not been run.
+  The handoff has one known mismatch: BoltzGen's <code>UNK</code> carries 5 atoms
+  (<code>N, CA, C, O, CB</code>) while Mol-1's carries 6 (adds <code>CG</code>),
+  so an adapter must strip <code>CG</code> and the <code>DV06..DV13</code>
+  virtual slots.
+</div>
+
+<footer>
+  Anchors are file:line in <code>/mnt/user_storage/Projects/df-boltzgen</code> and
+  <code>/mnt/user_storage/Projects/Mol-1</code> as of 22&nbsp;Nov&nbsp;2026.
+  Colours are categorical slots 1 and 2 of the reference palette, in fixed order;
+  every pipeline is also named in text and marked with a letter badge, so nothing
+  depends on colour alone. Light and dark surfaces are both defined.
+</footer>
+
+</div>
+</body>
+</html>

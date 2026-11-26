@@ -29,6 +29,12 @@ from biotite.structure import AtomArray
 from scipy.spatial.distance import cdist
 
 from mol.data.tokenizer import TokenArray
+from mol.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+#: Sentinel distinguishing "not computed yet" from a cached ``None``.
+_UNSET = object()
 
 
 def identify_mol_type(
@@ -126,6 +132,7 @@ def get_spatial_crop_index(
     crop_complete_ligand_unstdRes: bool = False,
     interface_crop: bool = False,
     interface_minimal_distance: int = 15,
+    anchor_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Crop sequences continuesly across chains.
@@ -138,6 +145,10 @@ def get_spatial_crop_index(
         crop_size: total crop size of the whole assembly
         interface_crop: whether use interface tokens as referenced token
         interface_minimal_distance: the minimal distance to any other chains
+        anchor_mask: [chain/interface_token_length,] LOCAL ADDITION. Restricts
+            the randomly-chosen crop centre to these reference tokens. Used to
+            centre a design crop on the region being designed; ignored (with a
+            warning) if it would leave nothing to choose from.
     Returns:
         selected_token_indices: torch.Tensor, shape=(min(crop_size, tokens.shape[0]), )
     """
@@ -164,6 +175,32 @@ def get_spatial_crop_index(
 
     # random select one token from reference_token_indices
     assert len(reference_token_indices) > 0, "No resolved atoms in reference tokens!"
+
+    # LOCAL ADDITION: centre the crop on the region being designed.
+    #
+    # The crop is k-nearest-neighbours around one randomly chosen reference
+    # token. On an antibody-antigen complex (median 1232 tokens) a 512 crop
+    # keeps ~42% of the structure, and an unconstrained centre lands in the
+    # designed CDRs only about as often as they are large -- a few percent. The
+    # rest of the time the example is cropped down to pure folding and the
+    # design loss has nothing to act on. Constraining the centre makes the CDRs
+    # and their immediate structural neighbourhood -- which is exactly the
+    # epitope contact surface -- the part that survives.
+    if anchor_mask is not None:
+        anchored = reference_token_indices[
+            anchor_mask.bool()[reference_token_indices]
+        ]
+        if anchored.numel() > 0:
+            reference_token_indices = anchored
+        else:
+            # Reachable: an interface crop whose interface tokens miss the
+            # designed loops entirely. Falling back to the unconstrained
+            # centre keeps the example usable rather than dropping it.
+            logger.warning(
+                "design crop: no designed token among the %d reference tokens; "
+                "falling back to an unconstrained crop centre",
+                len(reference_token_indices),
+            )
 
     random_idx = torch.randint(0, reference_token_indices.shape[0], (1,)).item()
     reference_token_idx = reference_token_indices[random_idx].item()
@@ -459,6 +496,54 @@ class CropData(object):
         self.spatial_crop_complete_lig = spatial_crop_complete_lig
         self.drop_last = drop_last
         self.remove_metal = remove_metal
+        self._design_token_mask = _UNSET
+
+        # LOCAL ADDITION: the crop centre is drawn from `ref_chain_indices`,
+        # which the sampler picks by chain/interface weight and which on an
+        # antibody-antigen complex is frequently the antigen. The designed
+        # residues are on the antibody, so without this the anchor set is
+        # empty and every such example falls back to an unanchored crop. Add
+        # the designed chains rather than replace: the sampler's choice still
+        # decides which interface the crop is built around.
+        design_mask = self.design_token_mask()
+        if design_mask is not None:
+            centre_atoms = self.atom_array[
+                self.token_array.get_annotation("centre_atom_index")
+            ]
+            design_chains = set(
+                np.unique(centre_atoms.asym_id_int[design_mask.numpy()]).tolist()
+            )
+            if not design_chains & set(self.ref_chain_indices):
+                self.ref_chain_indices = sorted(
+                    set(self.ref_chain_indices) | design_chains
+                )
+
+    def design_token_mask(self) -> Optional[torch.Tensor]:
+        """Boolean mask over all tokens: is this token a designed residue?
+
+        LOCAL ADDITION. Returns ``None`` when the example has none, so every
+        design-aware branch below collapses to the stock behaviour on a
+        folding example.
+
+        A designed residue *is* the 14-slot ``UNK`` component, so the residue
+        name identifies it with no extra annotation. ``is_ligand`` must be
+        excluded: Mol-1 tokenizes a ligand one token per atom and its residues
+        are not amino acids, so a bare name test would scatter false anchors
+        across every ligand in the structure.
+        """
+        if self._design_token_mask is not _UNSET:
+            return self._design_token_mask
+
+        from mol.data.core.design_residue import DESIGN_RESIDUE
+
+        centre_atoms = self.atom_array[
+            self.token_array.get_annotation("centre_atom_index")
+        ]
+        mask = (centre_atoms.res_name == DESIGN_RESIDUE) & (~centre_atoms.is_ligand.astype(bool))
+        self._design_token_mask = (
+            None if not mask.any() else torch.from_numpy(np.asarray(mask, dtype=bool))
+        )
+        return self._design_token_mask
 
     def random_crop_method(self) -> str:
         """
@@ -467,7 +552,21 @@ class CropData(object):
         Returns:
             str: The name of the randomly selected cropping method.
         """
-        return random.choices(self.cand_crop_methods, k=1, weights=self.method_weights)[
+        weights = self.method_weights
+        if self.design_token_mask() is not None:
+            # LOCAL ADDITION: contiguous cropping takes a sequence window with
+            # no notion of where the designed residues are, so it cannot be
+            # steered the way the two spatial methods can. On a design example
+            # it would silently produce a folding example a fifth of the time.
+            # Drop it, and renormalise over the two spatial methods.
+            contiguous = self.cand_crop_methods.index("ContiguousCropping")
+            weights = list(weights)
+            weights[contiguous] = 0.0
+            if sum(weights) <= 0:
+                # The caller asked for contiguous-only. Honour the request
+                # rather than silently substituting a different method.
+                weights = list(self.method_weights)
+        return random.choices(self.cand_crop_methods, k=1, weights=weights)[
             0
         ]
 
@@ -650,6 +749,13 @@ class CropData(object):
                 token_dist_mask_1d[token_indices_in_ref][:, None]
                 * token_dist_mask_1d[None, :]
             )
+            # LOCAL ADDITION: the rows of `token_distance` are the reference
+            # chain's tokens, so the anchor must be expressed in that same
+            # indexing, not over all tokens.
+            design_mask = self.design_token_mask()
+            anchor_mask = (
+                None if design_mask is None else design_mask[token_indices_in_ref]
+            )
             selected_token_indices, reference_token_index = get_spatial_crop_index(
                 tokens=tokens,
                 chain_id=chain_id,
@@ -660,6 +766,7 @@ class CropData(object):
                 crop_size=self.crop_size,
                 crop_complete_ligand_unstdRes=self.spatial_crop_complete_lig,
                 interface_crop=interface_crop,
+                anchor_mask=anchor_mask,
             )
         return (
             selected_token_indices,

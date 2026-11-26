@@ -338,7 +338,8 @@ loss_configs = {
             "alpha_diffusion": 4.0,
             "alpha_distogram": 3e-2,
             "alpha_bond": 0.0,  # or 1 in finetuning stages
-            "smooth_lddt": 1.0,  # or 0 in finetuning stages
+            "alpha_soft_decode": 0.0,
+            "smooth_lddt": 0,  # or 0 in finetuning stages
         },
         "plddt": {
             "min_bin": 0,
@@ -368,9 +369,15 @@ loss_configs = {
                 "weight_dna": 5.0,
                 "weight_rna": 5.0,
                 "weight_ligand": 10.0,
+                "weight_design": 0.0,
                 "eps": 1e-6,
             },
             "bond": {
+                "eps": 1e-6,
+            },
+            "soft_decode": {
+                "tau": 0.5,
+                "threshold": 0.5,
                 "eps": 1e-6,
             },
             "smooth_lddt": {

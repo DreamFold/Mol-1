@@ -23,6 +23,7 @@ import functools
 import gzip
 import logging
 import random
+import re
 import warnings
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -99,6 +100,16 @@ if not hasattr(pdbx_convert, "PDBX_COVALENT_TYPES"):
     )
 # Ignore inter residue metal coordinate bonds in mmcif _struct_conn
 pdbx_convert.PDBX_BOND_TYPE_ID_TO_TYPE.pop("metalc", None)
+
+
+#: Trailing ``_v<N>`` written by scripts/prepare_design_data.py to keep each
+#: task variant's ``_entry.id`` unique. Not part of the real PDB id.
+_DESIGN_VARIANT_SUFFIX = re.compile(r"_v\d+$")
+
+
+def _base_pdb_id(pdb_id: str) -> str:
+    """The real PDB id behind a design-variant id. ``1xct_v1`` -> ``1xct``."""
+    return _DESIGN_VARIANT_SUFFIX.sub("", pdb_id)
 
 
 class MMCIFParser:
@@ -1636,7 +1647,25 @@ class MMCIFParser:
                 if len(sequence) < 10:
                     cluster_id = sequence
                 else:
-                    pdb_entity = f"{self.pdb_id}_{entity_id}"
+                    # LOCAL ADDITION: strip the design-variant suffix.
+                    #
+                    # scripts/prepare_design_data.py gives each task variant
+                    # its own `_entry.id` (`1xct_v1`), because
+                    # prepare_training_data names its output from the parsed
+                    # id and same-named variants otherwise overwrite each
+                    # other. But this id is ALSO the key into the RCSB 40%
+                    # cluster file, which only knows real PDB entries -- so
+                    # every variant missed and fell through to
+                    # "NotInClusterTxt".
+                    #
+                    # Not cosmetic: `calc_weights_for_df` derives
+                    # cluster_size by grouping on cluster_id and weights each
+                    # row by 1/cluster_size, so the misses collapse into one
+                    # huge cluster. Measured on design_data_v2, 28% of rows
+                    # received 0.26% of the sampling probability -- a 150x
+                    # suppression. A variant is the same protein as its base,
+                    # so the base id is the correct key.
+                    pdb_entity = f"{_base_pdb_id(self.pdb_id)}_{entity_id}"
                     if pdb_entity in pdb_cluster_dict:
                         cluster_id, _ = pdb_cluster_dict[pdb_entity]
                     elif entity_type == "polypeptide(D)":

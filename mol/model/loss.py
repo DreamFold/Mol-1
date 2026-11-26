@@ -1077,6 +1077,7 @@ class MSELoss(nn.Module):
         weight_dna: float = 5.0,
         weight_rna: float = 5.0,
         weight_ligand: float = 10.0,
+        weight_design: float = 0.0,
         eps: float = 1e-6,
         reduction: str = "mean",
     ) -> None:
@@ -1085,6 +1086,8 @@ class MSELoss(nn.Module):
         self.weight_dna = weight_dna
         self.weight_rna = weight_rna
         self.weight_ligand = weight_ligand
+        # LOCAL ADDITION. See `forward`; 0.0 reproduces upstream exactly.
+        self.weight_design = weight_design
         self.eps = eps
         self.reduction = reduction
 
@@ -1164,6 +1167,7 @@ class MSELoss(nn.Module):
         is_rna: torch.Tensor,
         is_ligand: torch.Tensor,
         per_sample_scale: torch.Tensor = None,
+        is_design: torch.Tensor = None,
     ) -> torch.Tensor:
         """MSELoss
 
@@ -1178,6 +1182,9 @@ class MSELoss(nn.Module):
                 [N_atom] or [..., N_atom]
             per_sample_scale (torch.Tensor, optional): whether to scale the loss by the per-sample noise-level.
                 [..., N_sample]
+            is_design (torch.Tensor, optional): atoms belonging to a designed
+                residue, up-weighted by ``weight_design``.
+                [N_atom] or [..., N_atom]
 
         Returns:
             torch.Tensor: the weighted mse loss.
@@ -1195,11 +1202,69 @@ class MSELoss(nn.Module):
                 is_ligand=is_ligand,
             )
 
+        # LOCAL ADDITION: concentrate the error on the designed region.
+        #
+        # Why, and why only here. At inference the framework is pinned and only
+        # the designed residues are generated, so an unweighted mean over every
+        # atom spends ~97% of the gradient on atoms the model never has to
+        # place. This multiplies the designed atoms' squared error by
+        # (1 + weight_design) while leaving `weight` -- and therefore the rigid
+        # alignment computed above -- untouched, so the frame stays anchored on
+        # the framework. Mirrors BoltzGen's `res_type_weight` / `fake_atom_weight`
+        # (diffusion.py:800-820), which are likewise kept out of `align_weights`.
+        #
+        # The denominator stays `coordinate_mask.sum()`, matching how the
+        # existing mol-type weights behave in this function: the designed region
+        # raises the loss magnitude rather than being renormalised away. That is
+        # the point -- renormalising would cancel the emphasis.
+        mse_weight = weight
+        if is_design is not None and self.weight_design:
+            mse_weight = mse_weight * (
+                1.0 + self.weight_design * is_design.to(weight.dtype)
+            )
+
         # Calculate MSE loss
         per_atom_se = ((pred_coordinate - true_coordinate_aligned) ** 2).sum(
             dim=-1
         )  # [..., N_sample, N_atom]
-        per_sample_weighted_mse = (weight * per_atom_se).sum(dim=-1) / (
+
+        # LOCAL ADDITION: split the error into its designed and framework
+        # halves, as a diagnostic only.
+        #
+        # Why this is needed. The aggregate `mse_loss` can fall while the
+        # design task does not improve at all: the framework is roughly half
+        # the weighted loss, and the base model is already an excellent folder,
+        # so "loss going down" is consistent with the designed residues being
+        # ignored. Without the split there is no way to tell those apart from
+        # the training curves, which is exactly the ambiguity xid 268 ran into.
+        #
+        # `design_share` is the sharpest of the three: it is the fraction of
+        # the *weighted* error that the designed atoms carry, so it reports
+        # directly whether `weight_design` is doing what it was set to do.
+        # Stored on the module rather than returned so the call signature --
+        # and every other caller of MSELoss -- is untouched.
+        self.last_split = None
+        if is_design is not None:
+            with torch.no_grad():
+                resolved = coordinate_mask
+                d = is_design.to(per_atom_se.dtype) * resolved
+                f = (1.0 - is_design.to(per_atom_se.dtype)) * resolved
+                eps = self.eps
+
+                def _mean(mask):
+                    return (
+                        (per_atom_se * mask).sum(dim=-1)
+                        / (mask.sum(dim=-1) + eps)
+                    ).mean()
+
+                weighted = mse_weight * per_atom_se
+                total = weighted.sum() + eps
+                self.last_split = {
+                    "design": _mean(d).detach(),
+                    "framework": _mean(f).detach(),
+                    "design_share": ((weighted * d).sum() / total).detach(),
+                }
+        per_sample_weighted_mse = (mse_weight * per_atom_se).sum(dim=-1) / (
             coordinate_mask.sum(dim=-1, keepdim=True) + self.eps
         )  # [..., N_sample]
 
@@ -1445,6 +1510,12 @@ class PLDDTLoss(nn.Module):
         return loss
 
 
+# LOCAL ADDITION. Imported at module scope rather than lazily: unlike the
+# design masker, this has no optional-fork story -- if the file is missing the
+# config key that enables it cannot be satisfied either.
+from mol.model.design_decode_loss import SoftDecodeLoss  # noqa: E402
+
+
 class MolLoss(nn.Module):
     """Aggregation of the various losses"""
 
@@ -1458,6 +1529,10 @@ class MolLoss(nn.Module):
         self.alpha_diffusion = self.configs.loss.weight.alpha_diffusion
         self.alpha_distogram = self.configs.loss.weight.alpha_distogram
         self.alpha_bond = self.configs.loss.weight.alpha_bond
+        # LOCAL ADDITION. `.get` so a config predating this key still loads.
+        self.alpha_soft_decode = self.configs.loss.weight.get(
+            "alpha_soft_decode", 0.0
+        )
         self.weight_smooth_lddt = self.configs.loss.weight.smooth_lddt
 
         self.lddt_radius = {
@@ -1474,6 +1549,8 @@ class MolLoss(nn.Module):
             # diffusion
             "mse_loss": self.alpha_diffusion,
             "bond_loss": self.alpha_diffusion * self.alpha_bond,
+            # LOCAL ADDITION
+            "soft_decode_loss": self.alpha_diffusion * self.alpha_soft_decode,
             "smooth_lddt_loss": self.alpha_diffusion
             * self.weight_smooth_lddt,  # Different from AF3 appendix eq(6), where smooth_lddt has no weight
             # distogram
@@ -1487,6 +1564,14 @@ class MolLoss(nn.Module):
         self.pae_loss = PAELoss(**configs.loss.pae)
         self.mse_loss = MSELoss(**configs.loss.diffusion.mse)
         self.bond_loss = BondLoss(**configs.loss.diffusion.bond)
+        # LOCAL ADDITION. Constructed unconditionally -- it holds no
+        # parameters, so this cannot change a checkpoint's state dict --
+        # but only added to the loss set when its weight is non-zero.
+        self.soft_decode_loss = SoftDecodeLoss(
+            **{k: v for k, v in dict(
+                configs.loss.diffusion.get("soft_decode", {})
+            ).items() if k != "eps"}
+        )
         self.smooth_lddt_loss = SmoothLDDTLoss(**configs.loss.diffusion.smooth_lddt)
         self.distogram_loss = DistogramLoss(**configs.loss.distogram)
 
@@ -1612,7 +1697,99 @@ class MolLoss(nn.Module):
             cum_loss = cum_loss + weight * loss
         all_metrics["loss"] = cum_loss.detach().clone()
 
+        # LOCAL ADDITION: the design/framework split recorded by MSELoss.
+        # Every name contains "loss" on purpose -- `MolTrainer.train_step`
+        # filters the dict with `if "loss" not in key: continue`
+        # (mol/runner/train.py:629), so a key named e.g. `design_share` would
+        # be silently dropped and the wiring would look done while logging
+        # nothing.
+        split = getattr(self.mse_loss, "last_split", None)
+        if split is not None:
+            all_metrics["mse_loss_design"] = split["design"]
+            all_metrics["mse_loss_framework"] = split["framework"]
+            all_metrics["mse_loss_design_share"] = split["design_share"]
+
         return cum_loss, all_metrics
+
+    def _design_token_mask(
+        self, feat_dict: dict[str, Any]
+    ) -> Optional[torch.Tensor]:
+        """Token-level "this is a designed residue", or ``None``.
+
+        ``_design_atom_mask`` broadcasts this down to atoms for the MSE
+        weighting. The decode surrogate needs it at token level instead,
+        because it reassembles whole residues.
+        """
+        try:
+            from mol.model.design_masker import infer_design_mask
+        except ImportError:  # pragma: no cover - design fork not present
+            return None
+        mask = infer_design_mask(feat_dict)
+        if mask is None or not bool(mask.any()):
+            return None
+        return mask
+
+    def _design_atom_mask(
+        self, feat_dict: dict[str, Any]
+    ) -> Optional[torch.Tensor]:
+        """Float per-atom mask over atoms of designed residues, or ``None``.
+
+        Returns ``None`` -- not a zero tensor -- when there is nothing being
+        designed, so the loss path is bit-identical to upstream on a folding
+        batch rather than merely numerically equal.
+
+        Note what this does and does not reach. All 14 slots of a designed
+        residue are covered, but ``MSELoss`` multiplies the weight by
+        ``coordinate_mask``, so only *resolved* slots contribute. On a
+        correctly prepared structure every slot of a converted residue is
+        resolved -- the codebook parks the surplus slots on real backbone
+        atoms, so they have genuine label coordinates -- and the identity code
+        is therefore supervised.
+
+        That is a property of the *data*, not of this function. The first
+        prepared set violated it: entity-copy chains inherited an ``UNK``
+        sequence without having their atoms converted, leaving residues whose
+        virtual slots were all unresolved. Such a residue is masked on the
+        input side and weighted here, but has no codeword to learn. See
+        ``scripts/prepare_design_data.py:expand_targets_to_entity_copies``.
+        """
+        if not self.configs.loss.diffusion.mse.get("weight_design", 0.0):
+            return None
+        try:
+            from mol.data.core.design_residue import N_DESIGN_SLOTS
+            from mol.model.design_masker import infer_design_mask
+        except ImportError:  # pragma: no cover - design fork not present
+            return None
+
+        token_design = infer_design_mask(feat_dict)
+        if token_design is None or not bool(token_design.any()):
+            return None
+
+        atom_to_token_idx = feat_dict.get("atom_to_token_idx")
+        if atom_to_token_idx is None:
+            logger.warning(
+                "weight_design is set but atom_to_token_idx is absent; "
+                "the designed region cannot be located, so the loss is left "
+                "unweighted."
+            )
+            return None
+
+        # Restrict to tokens that actually carry the 14-slot layout.
+        # `infer_design_mask` deliberately also flags natively-UNK deposited
+        # residues -- masking their inputs is right, since their identity is
+        # unknown too -- but those have no codeword to learn, and poly-UNK
+        # traces in the PDB are often a single CA-like atom. Measured on
+        # overfit8: 8 of 170 flagged tokens (4.7%) hold one atom, not 14.
+        # Up-weighting them teaches nothing and dilutes `weight_design`.
+        flat = token_design.reshape(-1).to(torch.float32)
+        counts = torch.bincount(atom_to_token_idx.reshape(-1).long(),
+                                minlength=flat.numel())
+        flat = flat * (counts[: flat.numel()] == N_DESIGN_SLOTS).to(flat.dtype)
+
+        # Mol-1 has no padding masks and batch_size=1, so a gather over the
+        # token index is the whole scatter. (BoltzGen uses a bmm against a
+        # one-hot `atom_to_token`; there is no such dense matrix here.)
+        return flat[atom_to_token_idx.reshape(-1).long()]
 
     def calculate_losses(
         self,
@@ -1636,6 +1813,16 @@ class MolLoss(nn.Module):
                 - metrics (dict[str, torch.Tensor]): Dictionary containing aggregated metrics.
         """
         assert mode in ["train", "eval"]
+
+        # LOCAL ADDITION: per-atom "this atom belongs to a designed residue".
+        # Derived here rather than plumbed through the model because the design
+        # task is expressed at data-prep time (a designed residue *is* the
+        # 14-slot UNK component), so `feat_dict` already carries everything
+        # needed and no new feature key has to cross the model boundary.
+        # `None` on a pure-folding batch, which makes MSELoss fall through to
+        # its upstream behaviour.
+        is_design_atom = self._design_atom_mask(feat_dict)
+
         if mode == "train":
             # Confidence Loss: use mini-rollout coordinates
             confidence_coordinate = "coordinate_mini"
@@ -1720,9 +1907,42 @@ class MolLoss(nn.Module):
                         is_dna=feat_dict["is_dna"],
                         is_ligand=feat_dict["is_ligand"],
                         per_sample_scale=diffusion_per_sample_scale,
+                        is_design=is_design_atom,
                     ),
                 }
             )
+            # LOCAL ADDITION: differentiable codebook decode. Registered only
+            # when it is switched on AND the batch actually designs something,
+            # so a folding batch keeps the upstream loss set unchanged rather
+            # than carrying a term that evaluates to zero.
+            design_token_mask = (
+                self._design_token_mask(feat_dict)
+                if self.alpha_soft_decode
+                else None
+            )
+            if design_token_mask is not None:
+                missing = [k for k in ("atom_to_token_idx",
+                                       "atom_to_tokatom_idx")
+                           if feat_dict.get(k) is None]
+                if missing:
+                    logger.warning(
+                        "alpha_soft_decode is set but %s absent; the designed "
+                        "residues cannot be reassembled, so the decode loss "
+                        "is skipped.", ", ".join(missing))
+                else:
+                    loss_fns.update(
+                        {
+                            "soft_decode_loss": lambda: self.soft_decode_loss(
+                                pred_coordinate=pred_dict["coordinate"],
+                                true_coordinate=label_dict["coordinate"],
+                                coordinate_mask=label_dict["coordinate_mask"],
+                                design_token_mask=design_token_mask,
+                                atom_to_token_idx=feat_dict["atom_to_token_idx"],
+                                atom_to_tokatom_idx=feat_dict[
+                                    "atom_to_tokatom_idx"],
+                            ),
+                        }
+                    )
             # Distogram Loss
             if "distogram" in pred_dict:
                 loss_fns.update(

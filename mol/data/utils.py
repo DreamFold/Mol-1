@@ -18,6 +18,7 @@
 # Upstream revision: bd54a05d047b8925a241056f36d619700604068a
 # Upstream file: protenix/data/utils.py
 
+from functools import lru_cache
 import argparse
 import copy
 import functools
@@ -161,10 +162,19 @@ def replace_elem_by_mapping_dict(input_array: np.ndarray, mapping: dict) -> np.n
 
 
 @functools.lru_cache
+@lru_cache(maxsize=4)
 def parse_pdb_cluster_file_to_dict(
     cluster_file: str, remove_uniprot: bool = True
 ) -> dict[str, tuple]:
     """parse PDB cluster file, and return a pandas dataframe
+
+    LOCAL ADDITION: cached. ``MMCIFParser.make_chain_indices`` calls this
+    once per STRUCTURE (``parser.py:1931``), and the RCSB 40% cluster file is
+    22 MB / 552,548 entries -- roughly 0.5-2 s and 76 MB allocated and freed
+    every time. Over a 15,534-structure build that is hours of pure
+    reparsing across every worker, for a static reference file that cannot
+    change mid-run. Keyed on the path, so a different file still re-reads.
+
     example cluster file:
     https://cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-40.txt
 

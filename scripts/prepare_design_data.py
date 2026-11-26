@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import json
 import logging
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -78,6 +79,7 @@ from dfnv.design.cdr_tasks import (  # noqa: E402
     build_cdr_groups,
     select_task,
 )
+from mol.data.core import design_residue  # noqa: E402
 from mol.data.core.design_residue import (  # noqa: E402
     DESIGN_RESIDUE,
     N_DESIGN_SLOTS,
@@ -108,6 +110,9 @@ class DesignStats:
         self.residues_designed = 0
         self.residues_skipped_unresolved = 0
         self.residues_skipped_nonstandard = 0
+        # Positions dropped because an entity's chain copies disagreed about
+        # whether they could be coded. See `convertible_per_entity`.
+        self.residues_dropped_copy_mismatch = 0
         self.chains_missing = 0
         self.failures = 0
         self.fold_examples = 0
@@ -131,6 +136,7 @@ class DesignStats:
             f"designed_residues={self.residues_designed} "
             f"skipped_unresolved={self.residues_skipped_unresolved} "
             f"skipped_nonstandard={self.residues_skipped_nonstandard} "
+            f"dropped_copy_mismatch={self.residues_dropped_copy_mismatch} "
             f"chains_missing={self.chains_missing} failures={self.failures} "
             f"fold_examples={self.fold_examples} fold_dupes_skipped={self.fold_duplicates} tasks={self.tasks}"
         )
@@ -156,15 +162,21 @@ def designed_label_seqs(ranges: Iterable[tuple[int, int]]) -> set[int]:
     return {i for start, end in ranges for i in range(start, end + 1)}
 
 
-def rewrite_residue(residue: gemmi.Residue, codebook, stats: DesignStats) -> bool:
-    """Rewrite one residue in place into the designed 14-slot layout.
+def encoded_slots(residue: gemmi.Residue, codebook, stats: DesignStats):
+    """The 14 slot positions for ``residue``, or ``None`` if it cannot be coded.
 
-    Returns True when the residue was converted. A residue whose codebook atoms
-    are not all resolved is left untouched -- it has no usable label.
+    A residue is uncodeable when it is not a standard amino acid, or when any
+    atom its codebook entry needs is unresolved -- in either case there is no
+    label for the designed slots, so converting it would produce a residue the
+    model is asked about and cannot be scored on.
+
+    Split out of :func:`rewrite_residue` so convertibility can be decided for
+    a whole entity *before* anything is rewritten; see
+    :func:`convertible_per_entity`.
     """
     if residue.name not in codebook:
         stats.residues_skipped_nonstandard += 1
-        return False
+        return None
 
     coords = {}
     for atom in residue:
@@ -173,9 +185,20 @@ def rewrite_residue(residue: gemmi.Residue, codebook, stats: DesignStats) -> boo
         coords.setdefault(atom.name, (atom.pos.x, atom.pos.y, atom.pos.z))
 
     try:
-        slots = encode_residue(residue.name, coords, codebook)
+        return encode_residue(residue.name, coords, codebook)
     except KeyError:
         stats.residues_skipped_unresolved += 1
+        return None
+
+
+def rewrite_residue(residue: gemmi.Residue, codebook, stats: DesignStats) -> bool:
+    """Rewrite one residue in place into the designed 14-slot layout.
+
+    Returns True when the residue was converted. A residue whose codebook atoms
+    are not all resolved is left untouched -- it has no usable label.
+    """
+    slots = encoded_slots(residue, codebook, stats)
+    if slots is None:
         return False
 
     template = residue[0]  # inherit b-factor / occupancy / altloc conventions
@@ -196,6 +219,116 @@ def rewrite_residue(residue: gemmi.Residue, codebook, stats: DesignStats) -> boo
     return True
 
 
+def expand_targets_to_entity_copies(
+    structure: gemmi.Structure, targets: dict[str, set[int]]
+) -> dict[str, set[int]]:
+    """Extend ``targets`` to every subchain sharing an entity with a target.
+
+    Without this the prepared file contradicts itself, and the contradiction
+    is invisible until training.
+
+    The CDR annotation names one chain -- say entity 2's subchain ``E``. But
+    ``patch_entity_sequences`` has to rewrite the *entity's* canonical
+    sequence, because Mol-1's parser trusts ``entity_poly_seq`` over
+    ``atom_site``, and an entity has no per-chain sequence to patch. So when
+    entity 2 also owns subchain ``B`` -- a second copy of the same light chain,
+    which is the norm in a crystal form with several Fabs in the asymmetric
+    unit -- ``B`` inherits a sequence saying those positions are ``UNK`` while
+    its ``atom_site`` records still hold the native residue.
+
+    Mol-1 then builds ``B``'s residues from the 14-slot ``UNK`` component and
+    keeps only the atoms whose names it has slots for: ``N``, ``CA``, ``C``,
+    ``O`` and sometimes ``CB``/``CG``. Every virtual slot is unresolved. The
+    result is a residue that *looks* designed to the model -- its inputs are
+    masked, it is counted in the design loss and in ``design_seq_recovery`` --
+    but whose label carries no codeword at all, so there is nothing for the
+    model to learn from it.
+
+    Measured on the prepared ``design_data_mix``: 8EB2's designed entities each
+    own three subchains, so **two thirds** of its "designed" residues were
+    phantoms of this kind; across a 20-batch sample, 5 of 14 design structures
+    were affected and their designed-atom supervision rate was 0.38 instead of
+    1.00.
+
+    Converting every copy is the fix that keeps the file self-consistent, and
+    it is also the right task definition: the copies are the same antibody
+    chain, so the same CDRs are being designed in each.
+    """
+    by_entity: dict[str, list[str]] = {}
+    for entity in structure.entities:
+        for subchain_id in entity.subchains:
+            by_entity.setdefault(entity.name, []).append(subchain_id)
+
+    expanded = {k: set(v) for k, v in targets.items()}
+    for subchains in by_entity.values():
+        shared: set[int] = set()
+        for subchain_id in subchains:
+            shared |= targets.get(subchain_id, set())
+        if not shared:
+            continue
+        for subchain_id in subchains:
+            expanded.setdefault(subchain_id, set()).update(shared)
+    return expanded
+
+
+def convertible_per_entity(
+    structure: gemmi.Structure,
+    targets: dict[str, set[int]],
+    codebook,
+    stats: DesignStats,
+) -> dict[str, set[int]]:
+    """Narrow ``targets`` to positions convertible in **every** copy.
+
+    A residue is skipped when its codebook atoms are unresolved, and two
+    copies of the same chain need not be unresolved in the same places -- a
+    sidechain can be ordered in one Fab of the asymmetric unit and disordered
+    in the next. Since the entity carries one sequence for all its copies,
+    a position converted in only some of them reproduces, in miniature,
+    exactly the inconsistency :func:`expand_targets_to_entity_copies` exists
+    to remove: the sequence says ``UNK``, one copy's atoms agree and another's
+    do not.
+
+    Taking the intersection costs a few residues per structure and makes the
+    guarantee absolute: every position the entity sequence calls designed has
+    14 coded atoms in every chain. The alternative -- the union -- cannot be
+    made consistent at all, because the missing atoms do not exist.
+
+    This pass, not the rewriting pass, is where uncodeable residues are seen
+    and therefore where they are counted: the rewriting pass is only ever
+    handed positions that already passed here, so leaving the counters to it
+    would report zero skips however many there were.
+    """
+    per_subchain: dict[str, set[int]] = {}
+    for chain in structure[0]:
+        for subchain in chain.subchains():
+            label_id = subchain.subchain_id()
+            wanted = targets.get(label_id)
+            if not wanted:
+                continue
+            ok = per_subchain.setdefault(label_id, set())
+            for residue in subchain:
+                if residue.label_seq in wanted and (
+                    encoded_slots(residue, codebook, stats) is not None
+                ):
+                    ok.add(residue.label_seq)
+
+    narrowed: dict[str, set[int]] = {}
+    for entity in structure.entities:
+        copies = [s for s in entity.subchains if s in per_subchain]
+        if not copies:
+            continue
+        shared = set.intersection(*(per_subchain[s] for s in copies))
+        for subchain_id in copies:
+            stats.residues_dropped_copy_mismatch += len(
+                per_subchain[subchain_id] - shared
+            )
+            narrowed[subchain_id] = set(shared)
+    # Subchains no entity claims keep their own convertible set.
+    for label_id, seqs in per_subchain.items():
+        narrowed.setdefault(label_id, seqs)
+    return narrowed
+
+
 def design_structure(
     structure: gemmi.Structure,
     targets: dict[str, set[int]],
@@ -203,21 +336,28 @@ def design_structure(
     stats: DesignStats,
 ) -> int:
     """Rewrite every targeted residue. ``targets`` maps label_asym_id -> seqs."""
+    # Keep the original for the chains_missing count: that statistic means
+    # "an annotated chain was not found in the file", and an entity copy that
+    # the annotation never named should not be able to trip it.
+    annotated = set(targets)
+    expanded = expand_targets_to_entity_copies(structure, targets)
+    targets = convertible_per_entity(structure, expanded, codebook, stats)
     converted: dict[str, set[int]] = {}
     seen: set[str] = set()
     for chain in structure[0]:
         for subchain in chain.subchains():
             label_id = subchain.subchain_id()
+            if label_id in expanded:
+                seen.add(label_id)
             wanted = targets.get(label_id)
             if not wanted:
                 continue
-            seen.add(label_id)
             for residue in subchain:
                 if residue.label_seq in wanted and rewrite_residue(
                     residue, codebook, stats
                 ):
                     converted.setdefault(label_id, set()).add(residue.label_seq)
-    stats.chains_missing += len(set(targets) - seen)
+    stats.chains_missing += len(annotated - seen)
     return converted
 
 
@@ -383,8 +523,26 @@ def process_row(
         # listing the native residues makes the parser rebuild them and discard
         # every designed atom, silently producing an ordinary folding example.
         structure.setup_entities()
+        # The filename is NOT what identifies a structure downstream.
+        # `prepare_training_data.py` keys its output on the parsed
+        # `_entry.id` (``mol/data/core/parser.py:165``), not on the file
+        # stem, so two variants that both declare ``1A4J`` write to the same
+        # ``1a4j.pkl.gz`` and the last one to finish wins. The effects are
+        # worse than lost data: a fold variant can overwrite a design variant,
+        # turning a design example into a folding one, and which one survives
+        # depends on worker scheduling. Measured on the first build: every
+        # ``_v1`` file was silently discarded, capping 5270 prepared CIFs at
+        # 847 bioassemblies, and 37% of what remained had no designed residue.
+        #
+        # `_entry.id` comes from `Structure.info`, NOT from `Structure.name`
+        # (gemmi 0.7: setting only `.name` renames the data block and leaves
+        # `_entry.id` at its original value, which is exactly the field the
+        # parser reads). Both are set so the file is self-consistent.
+        variant_id = f"{pdb_id}{suffix_for(variant)}"
+        structure.name = variant_id.upper()
+        structure.info["_entry.id"] = variant_id.upper()
         structure.make_mmcif_document().write_file(
-            str(output_dir / f"{pdb_id}{suffix_for(variant)}.cif")
+            str(output_dir / f"{variant_id}.cif")
         )
     except Exception as exc:  # a malformed entry must not kill the run
         logger.warning("%s: %s: %s", pdb_id, type(exc).__name__, exc)
@@ -453,6 +611,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         entries = entries[: args.limit]
 
     codebook = build_codebook()
+
+    # Stamp which codeword table built this data. The codeword IS the label
+    # geometry: a set prepared under one strategy and trained under another
+    # is mislabelled in every designed residue, with matching shapes, finite
+    # losses and no warning anywhere -- the model just learns the wrong code.
+    # `load_codebook_stamp` turns that into a startup error.
+    stamp = args.output_dir / "codebook.json"
+    payload = {
+        "strategy": design_residue.CODEBOOK_STRATEGY,
+        "fingerprint": design_residue.codebook_fingerprint(codebook),
+        "n_slots": design_residue.N_DESIGN_SLOTS,
+        "codewords": {r: list(c) for r, (_, c) in sorted(codebook.items())},
+    }
+    if stamp.exists():
+        previous = json.loads(stamp.read_text())
+        if previous.get("fingerprint") != payload["fingerprint"]:
+            logger.error(
+                "%s was built with codebook %s (%s) but this run uses %s (%s). "
+                "Mixing them produces a silently mislabelled dataset. Write to "
+                "a new --output-dir, or rebuild the whole set.",
+                args.output_dir, previous.get("fingerprint"),
+                previous.get("strategy"), payload["fingerprint"],
+                payload["strategy"])
+            return 1
+    else:
+        stamp.write_text(json.dumps(payload, indent=1))
+    logger.info("codebook %s (%s)", payload["fingerprint"], payload["strategy"])
 
     task_options = {
         "mode": None if args.task == "sample" else args.task,
